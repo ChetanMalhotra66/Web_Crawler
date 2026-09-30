@@ -11,10 +11,15 @@ BackoffRetryMiddleware  - retryable failures get retried with exponential
                            backoff, up to a max of 3 attempts, per the design
                            doc. Fatal / exhausted-retry requests are logged
                            as dead-lettered for operator review instead of
-                           silently dropped.
+                           silently dropped, and a "failed" crawl-result
+                           record is written so the failure shows up in the
+                           same result log as successful fetches.
 """
+import json
 import logging
+import os
 import random
+from datetime import datetime, timezone
 
 from scrapy.downloadermiddlewares.retry import RetryMiddleware
 from scrapy.utils.response import response_status_message
@@ -65,7 +70,10 @@ class BackoffRetryMiddleware(RetryMiddleware):
         super().__init__(settings)
         self.base_delay = settings.getfloat("RETRY_BASE_DELAY", 2.0)
 
-    def _retry(self, request, reason, spider):
+    def _retry(self, request, reason):
+        # Scrapy >=2.13 dropped the `spider` arg here; get it from the crawler
+        # instead (needed for stats access and the dead-letter path below).
+        spider = self.crawler.spider
         retries = request.meta.get("retry_times", 0) + 1
         max_retry_times = request.meta.get("max_retry_times", self.max_retry_times)
 
@@ -96,4 +104,38 @@ class BackoffRetryMiddleware(RetryMiddleware):
         stats = getattr(spider.crawler, "stats", None)
         if stats:
             stats.inc_value("darktrace/dead_letter_count")
+
+        # Scrapy's own give-up path swallows the failure here rather than
+        # propagating it to the request's errback (confirmed: this is true
+        # even of stock RetryMiddleware, not something specific to this
+        # subclass), so the spider's "failed" crawl-result item would never
+        # get produced. Write the failed-result record directly to the same
+        # log the success-path pipeline uses, rather than depending on
+        # engine/pipeline machinery this middleware sits outside of.
+        _write_failed_crawl_result(spider, request, reason, attempts=retries)
         return None
+
+
+def _write_failed_crawl_result(spider, request, reason, attempts):
+    settings = spider.crawler.settings
+    log_path = settings.get("RESULT_LOG_PATH", "crawl_output/crawl_results.jsonl")
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+
+    record = {
+        "source_name": getattr(spider, "source_name", None),
+        "source_type": getattr(spider, "source_type", None),
+        "url": request.url,
+        "network": request.meta.get("network", "clearnet"),
+        "fetch_timestamp": datetime.now(timezone.utc).isoformat(),
+        "crawler_build": settings.get("CRAWLER_BUILD"),
+        "status": "failed",
+        "http_status": None,
+        "attempt": attempts,
+        "title": None,
+        "content_hash": None,
+        "duplicate_of_existing": False,
+        "evidence_path": None,
+        "error": str(reason)[:500],
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")

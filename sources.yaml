@@ -1,0 +1,47 @@
+# Authorized source registry.
+#
+# Each entry is one source the engine is allowed to crawl. The scheduler
+# reads this file every tick and enqueues a crawl job for any source that's
+# "due" (now - last_crawled >= interval_minutes) and not already in progress.
+#
+# priority routes the job to one of three Celery queues (doc: "Redis-backed
+# Celery queues can separate fast, standard and bulk work"):
+#   fast     - short interval, time-sensitive (e.g. paste sites)
+#   standard - normal cadence (blogs, forums)
+#   bulk     - slow, heavy, or low-priority (marketplace listing sweeps)
+#
+# interval_minutes follows the doc's "different source types can have
+# different crawl frequencies based on their needs and policy."
+
+sources:
+  - name: news_source_1
+    url: "https://pypi.org/"          # placeholder authorized clearnet target
+    source_type: blog_news
+    priority: standard
+    interval_minutes: 30
+    timeout_seconds: 120
+    enabled: true
+
+  - name: paste_source_1
+    url: "https://pypi.org/search/?q=example"
+    source_type: paste_site
+    priority: fast
+    interval_minutes: 5
+    timeout_seconds: 60
+    enabled: true
+
+  - name: onion_source_1
+    url: "http://exampleauthorizedaddress.onion/"
+    source_type: onion_site
+    priority: bulk
+    interval_minutes: 120
+    timeout_seconds: 180
+    enabled: false          # disabled until a real authorized .onion target + Tor gateway are configured
+
+  - name: marketplace_source_1
+    url: "https://pypi.org/"          # placeholder authorized clearnet target
+    source_type: marketplace
+    priority: bulk
+    interval_minutes: 240
+    timeout_seconds: 180
+    enabled: true

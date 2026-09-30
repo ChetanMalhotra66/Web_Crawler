@@ -1,2 +1,5 @@
 scrapy>=2.11
 pysocks>=1.7.1
+celery[redis]>=5.3
+redis>=5.0
+PyYAML>=6.0

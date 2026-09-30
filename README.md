@@ -1,9 +1,15 @@
-# DarkTrace Crawling Engine — single-source prototype
+# DarkTrace Crawling Engine
 
-This is the first slice of the Crawling Engine:
-one authorized seed URL in, one crawl-result record out. No scheduler, task
-queue, or link-following yet — those layer on top of this without changing
-what's here.
+Two layers:
+- **Crawler/** — the single-source Scrapy spider. Fetches one authorized URL,
+  routes through Tor/I2P/direct based on the domain, parses it, hashes and
+  stores the content, and logs a crawl-result record. This is the unit of
+  work; it doesn't know about other sources or scheduling.
+- **engine/** — the queue-driven layer on top. Reads a multi-source registry
+  (`sources.yaml`), decides what's due, and dispatches crawl jobs across
+  Redis-backed Celery queues (fast/standard/bulk), with job-level retry,
+  dead-lettering, and per-source crawl state. This is what makes "single
+  source" into "many sources, on schedule, reliably."
 
 ## Setup
 
@@ -22,7 +28,21 @@ source venv/bin/activate
 
 pip install -r requirements.txt
 
-You need PySocks installed for Scrapy to support socks5h:// proxy URLs — it is included in requirements.txt.
+This now also installs Celery and Redis's Python client, plus PyYAML for
+the source registry.
+
+### 3. Install and start Redis
+
+Celery uses Redis as both the task broker and the crawl-state store.
+
+Linux (Ubuntu/Debian):
+sudo apt install redis-server
+sudo systemctl start redis-server
+
+macOS: `brew install redis && brew services start redis`
+Windows: easiest is Redis via WSL, or a Docker container (`docker run -p 6379:6379 redis`).
+
+Verify it's up: `redis-cli ping` should return `PONG`.
 
 ---
 
@@ -44,9 +64,7 @@ Both endpoints are configurable in Crawler/settings.py (TOR_SOCKS_PROXY, I2P_HTT
 
 ---
 
-## Running the Crawler
-
-Ensure your virtual environment is active and terminal is inside the Single_Source_Crawler folder, then run:
+## Running a single crawl directly (unchanged)
 
 # normal site
 scrapy crawl single_source -a url="https://example.com" -a source_type="normal"
@@ -61,6 +79,53 @@ scrapy crawl single_source -a url="http://<address>.i2p/" -a source_type="blog_n
 
 ---
 
+## Running the queue-driven engine (multiple sources)
+
+### 1. Define your sources
+
+Edit `sources.yaml`. Each entry needs a name, URL, source_type, priority
+(`fast` / `standard` / `bulk` — which Celery queue it's dispatched to), and
+`interval_minutes` (how often it's due to be re-crawled). Set `enabled: false`
+to keep a source registered but skip it.
+
+### 2. Start a worker
+
+celery -A engine.celery_app worker -Q fast,standard,bulk --concurrency=4 --loglevel=INFO
+
+This one worker command listens on all three queues. In production you'd
+typically run separate worker processes per queue so a flood of `bulk` jobs
+can't starve `fast` ones — e.g. `-Q fast --concurrency=4` and `-Q bulk
+--concurrency=2` as separate processes — but one worker on all three is
+fine to start with.
+
+### 3. Start the scheduler (Celery beat)
+
+celery -A engine.celery_app beat --loglevel=INFO
+
+This ticks every `SCHEDULER_TICK_SECONDS` (default 30s; set via env var),
+checks `sources.yaml` against each source's crawl state in Redis, and
+enqueues a job for anything that's due and not already running.
+
+You can also trigger one scheduling pass manually without beat, e.g. for
+testing:
+
+python -c "from engine.scheduler import check_and_schedule; print(check_and_schedule.apply_async(queue='standard').get())"
+
+### What you get out
+
+Same as the single-spider output, now written to by every source:
+- `crawl_output/raw/<sha256>.html` — preserved original content.
+- `crawl_output/crawl_results.jsonl` — one record per fetch attempt, success
+  or failure, across all sources.
+- `crawl_output/dead_letter.jsonl` — jobs that failed repeatedly at the
+  *process* level (crashed, timed out) after exhausting job-level retries.
+
+Crawl state per source (last run time, success/failure counts, whether
+it's currently running) lives in Redis under `crawlstate:<source_name>` —
+inspect it with `redis-cli hgetall crawlstate:news_source_1`.
+
+---
+
 ## How routing works
 
 ProxyRoutingMiddleware (Crawler/middlewares.py) looks at the hostname of each request:
@@ -72,25 +137,44 @@ Same spider, same code path, for all three.
 
 ---
 
-## What you get out
+## Reliability behavior — two layers
 
-- crawl_output/raw/<sha256>.html — the untouched original page content, preserved before any later processing (evidence).
-- crawl_output/crawl_results.jsonl — one JSON record per fetch: source, URL, network used, fetch timestamp, crawler build, HTTP status, attempt count, content hash, and whether the hash was already seen (cheap duplicate flag).
+**Request-level** (inside one Scrapy run, `Crawler/middlewares.py`):
+- `DOWNLOAD_TIMEOUT = 60` — generous, since Tor/I2P circuit setup is slow.
+- Retryable failures (5xx, 408, 429, connection/DNS errors) retry with
+  exponential backoff, capped at 3 attempts.
+- A page that exhausts its retries gets a `status: failed` record written
+  straight to `crawl_results.jsonl` — Scrapy's own retry-exhaustion path
+  doesn't call the spider's errback (confirmed during testing, true of
+  stock Scrapy too), so the middleware writes the failed result directly
+  rather than depending on that.
+- AUTOTHROTTLE + per-domain concurrency limit (1) keep this polite to a
+  single source.
 
----
+**Job-level** (across Scrapy runs, `engine/tasks.py`): this is a separate
+layer for when the whole crawl process itself is the problem — it crashed,
+hung past its timeout, or exited cleanly but the fetch inside it still
+failed (checked by reading back the crawl-result record the run just
+produced, not just the process exit code).
+- Failed jobs retry with exponential backoff (10s, 20s, 40s), capped at 3
+  attempts, separate from and on top of the request-level retries above.
+- A job that exhausts its retries is dead-lettered: logged to
+  `crawl_output/dead_letter.jsonl` and marked in the source's Redis state
+  for operator review, instead of silently vanishing.
 
-## Reliability behavior already wired in
-
-- DOWNLOAD_TIMEOUT = 60 — generous, since Tor/I2P circuit setup is slow.
-- Retryable failures (5xx, 408, 429, and connection errors) get retried with exponential backoff, capped at 3 attempts (BackoffRetryMiddleware), matching the design doc.
-- Requests that exhaust retries are logged as DEAD-LETTER and counted in darktrace/dead_letter_count in Scrapy's stats — the queue/operator-review step from the doc isn't built yet, but the hook point is there.
-- AUTOTHROTTLE + per-domain concurrency limit (1) keep this polite to a single source by default.
+**Scheduling fairness**: the scheduler skips any source whose last job is
+still `in_progress`, so one slow or stuck source can't pile up duplicate
+jobs. `worker_prefetch_multiplier = 1` in the Celery config spreads work
+evenly across sources rather than letting one worker slot hoard a batch
+from a single fast-producing source.
 
 ---
 
 ## Not built yet (next layers)
 
-- Scheduler / multi-source task queue (Celery + Redis, per the doc).
 - Link-following within scope/depth limits.
 - Incremental crawling (ETag/Last-Modified, forum thread cursors).
-- Dead-letter queue (currently just logged + counted, not requeued).
+- Requeueing from the dead-letter log (currently a log for manual operator
+  review, not an automatic retry queue).
+- Separate worker processes per queue tier for true fast/standard/bulk
+  isolation (currently documented as a "next step," not set up by default).
